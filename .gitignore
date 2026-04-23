@@ -1,0 +1,19 @@
+# Entorno virtual
+.venv/
+venv/
+env/
+
+# Caché de Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Modelos y datos temporales
+*.pt
+*.csv
+
+# Carpetas de VS Code
+.vscode/
+
+# Otros
+.DS_Store
