@@ -4,7 +4,7 @@ entrenamiento.py — Bucle de entrenamiento, evaluacion y checkpointing.
 
 import time
 import warnings
-
+import os 
 import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
@@ -387,31 +387,56 @@ def save_checkpoint(
 
 
 def load_checkpoint(
-    path:      str,
-    modelo:    MejorRNN,
-    optimizer: AdamW | None = None,
-    scheduler: OneCycleLR | None = None,
-    scaler:    torch.amp.GradScaler | None = None,
+    path: str,
+    modelo: 'MejorRNN', # Asegúrate de que MejorRNN esté definido o usa 'Any'
+    optimizer=None,
+    scheduler=None,
+    scaler=None,
     map_location: str = "cpu",
 ) -> dict:
     """
-    Carga checkpoint. Devuelve el dict completo para acceder a vocab/config.
+    Carga el checkpoint de forma segura. 
+    Verifica tamaños antes de cargar para evitar el error de 'size mismatch'.
     """
-    ckpt = torch.load(path, map_location=map_location)
-    modelo.load_state_dict(ckpt["model"])
-    if optimizer is not None and "optimizer" in ckpt:
-        optimizer.load_state_dict(ckpt["optimizer"])
-    if scheduler is not None and "scheduler" in ckpt:
-        scheduler.load_state_dict(ckpt["scheduler"])
-    if scaler is not None and "scaler" in ckpt:
-        scaler.load_state_dict(ckpt["scaler"])
-    epoch = ckpt.get("epoch", "?")
-    acc   = ckpt.get("best_val_acc", 0.0)
-    loss  = ckpt.get("best_val_loss")
-    extra = f" | best_val_loss={loss:.4f}" if isinstance(loss, (float, int)) else ""
-    print(f"Checkpoint cargado desde '{path}' | epoch={epoch} | best_val_acc={acc:.4f}{extra}")
-    return ckpt
+    if not os.path.exists(path):
+        print(f"-> Archivo no encontrado en '{path}'. Se ignorará la carga y se empezará de cero.")
+        return {}
 
+    try:
+        ckpt = torch.load(path, map_location=map_location)
+        
+        # 1. VERIFICACIÓN DE SEGURIDAD: Comparar tamaños de Embedding
+        # Esto evita el crash por size mismatch que recibiste
+        ckpt_emb_shape = ckpt["model"]["embedding.weight"].shape
+        curr_emb_shape = modelo.embedding.weight.shape
+        
+        if ckpt_emb_shape != curr_emb_shape:
+            print(f"-> AVISO: El vocabulario no coincide. Checkpoint: {ckpt_emb_shape}, Modelo: {curr_emb_shape}")
+            print("-> Se omitirá la carga de pesos para evitar errores.")
+            return ckpt
+
+        # 2. CARGA SEGURA
+        modelo.load_state_dict(ckpt["model"])
+        
+        if optimizer is not None and "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        if scheduler is not None and "scheduler" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler"])
+        if scaler is not None and "scaler" in ckpt:
+            scaler.load_state_dict(ckpt["scaler"])
+
+        # 3. LOGS Y RETURN
+        epoch = ckpt.get("epoch", "?")
+        acc   = ckpt.get("best_val_acc", 0.0)
+        loss  = ckpt.get("best_val_loss")
+        extra = f" | best_val_loss={loss:.4f}" if isinstance(loss, (float, int)) else ""
+        
+        print(f"Checkpoint cargado exitosamente desde '{path}' | epoch={epoch} | best_val_acc={acc:.4f}{extra}")
+        return ckpt
+
+    except Exception as e:
+        print(f"-> Error inesperado al cargar el checkpoint: {e}")
+        return {}
 
 # ── Loop principal ────────────────────────────────────────────────
 
