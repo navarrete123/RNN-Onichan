@@ -1,10 +1,15 @@
 """
-entrenamiento.py — Bucle de entrenamiento, evaluacion y checkpointing.
+entrenamiento.py - Bucle de entrenamiento, evaluacion y checkpointing.
 """
 
+from __future__ import annotations
+
+import json
+import os
 import time
 import warnings
-import os 
+from pathlib import Path
+
 import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
@@ -14,32 +19,32 @@ from tqdm.auto import tqdm
 
 from configuracion import Config
 from modelo_profesional import MejorRNN
+from visualizacion import save_learning_curves
 
-
-# ── Metricas ──────────────────────────────────────────────────────
 
 def _update_cm(matrix: torch.Tensor, targets: torch.Tensor, preds: torch.Tensor, n: int):
-    flat    = targets.detach().cpu() * n + preds.detach().cpu()
+    flat = targets.detach().cpu() * n + preds.detach().cpu()
     matrix += torch.bincount(flat, minlength=n * n).view(n, n)
 
 
 def _metrics(matrix: torch.Tensor) -> tuple[float, float]:
-    total    = matrix.sum().item()
+    total = matrix.sum().item()
     accuracy = matrix.diag().sum().item() / max(total, 1)
-    m        = matrix.float()
-    prec     = m.diag() / m.sum(0).clamp(min=1.0)
-    rec      = m.diag() / m.sum(1).clamp(min=1.0)
-    f1       = (2 * prec * rec / (prec + rec).clamp(min=1e-8)).mean().item()
+    scores = matrix.float()
+    precision = scores.diag() / scores.sum(0).clamp(min=1.0)
+    recall = scores.diag() / scores.sum(1).clamp(min=1.0)
+    f1 = (2 * precision * recall / (precision + recall).clamp(min=1e-8)).mean().item()
     return accuracy, f1
 
 
 def print_confusion_matrix(matrix: torch.Tensor, class_names: list[str]):
-    n    = len(class_names)
-    col  = max(len(c) for c in class_names) + 2
-    head = " " * (col + 2) + "".join(f"{c:>{col}}" for c in class_names)
-    print(head)
-    for i, name in enumerate(class_names):
-        row = f"  {name:<{col}}" + "".join(f"{matrix[i,j].item():>{col}}" for j in range(n))
+    if not class_names:
+        return
+    width = max(len(name) for name in class_names) + 2
+    header = " " * (width + 2) + "".join(f"{name:>{width}}" for name in class_names)
+    print(header)
+    for row_idx, name in enumerate(class_names):
+        row = f"  {name:<{width}}" + "".join(f"{matrix[row_idx, col].item():>{width}}" for col in range(len(class_names)))
         print(row)
 
 
@@ -52,7 +57,6 @@ def classwise_metrics(
     precision = scores.diag() / scores.sum(0).clamp(min=1.0)
     recall = scores.diag() / scores.sum(1).clamp(min=1.0)
     f1 = 2 * precision * recall / (precision + recall).clamp(min=1e-8)
-
     for idx, class_name in enumerate(class_names):
         rows.append(
             {
@@ -117,10 +121,7 @@ def _set_progress_postfix(
 ):
     if progress is None:
         return
-    postfix = {
-        "loss": f"{loss:.4f}",
-        "acc": f"{acc:.4f}",
-    }
+    postfix = {"loss": f"{loss:.4f}", "acc": f"{acc:.4f}"}
     if lr is not None:
         postfix["lr"] = f"{lr:.2e}"
     if gnorm is not None:
@@ -128,24 +129,21 @@ def _set_progress_postfix(
     progress.set_postfix(postfix, refresh=False)
 
 
-# ── Train epoch ───────────────────────────────────────────────────
-
 def train_epoch(
-    modelo:    MejorRNN,
-    loader:    DataLoader,
+    modelo: MejorRNN,
+    loader: DataLoader,
     optimizer: AdamW,
     scheduler: OneCycleLR,
-    scaler:    torch.amp.GradScaler,
-    cfg:       Config,
-    epoch:     int | None = None,
+    scaler: torch.amp.GradScaler,
+    cfg: Config,
+    epoch: int | None = None,
 ) -> tuple[float, float, float, float, float]:
-    """Devuelve (loss, accuracy, f1, grad_norm_avg, lr_final)."""
     modelo.train()
-    total_loss  = 0.0
+    total_loss = 0.0
     total_items = 0
     total_gnorm = 0.0
-    n_steps     = 0
-    confusion   = torch.zeros(cfg.num_classes, cfg.num_classes, dtype=torch.long)
+    n_steps = 0
+    confusion = torch.zeros(cfg.num_classes, cfg.num_classes, dtype=torch.long)
     amp_enabled = cfg.use_amp and cfg.device_type == "cuda"
     total_steps = len(loader)
     iterator, progress = _create_progress_bar(
@@ -158,9 +156,9 @@ def train_epoch(
     non_blocking = _non_blocking(cfg)
 
     for step, (x, lengths, y) in enumerate(iterator, 1):
-        x       = x.to(cfg.device, non_blocking=non_blocking)
+        x = x.to(cfg.device, non_blocking=non_blocking)
         lengths = lengths.to(cfg.device, non_blocking=non_blocking)
-        y       = y.to(cfg.device, non_blocking=non_blocking)
+        y = y.to(cfg.device, non_blocking=non_blocking)
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -183,26 +181,18 @@ def train_epoch(
 
         preds = logits.argmax(1)
         _update_cm(confusion, y, preds, cfg.num_classes)
-        bs          = x.size(0)
-        total_loss  += loss.item() * bs
-        total_items += bs
-        total_gnorm += gnorm.item()
-        n_steps     += 1
+        batch_size = x.size(0)
+        total_loss += loss.item() * batch_size
+        total_items += batch_size
+        total_gnorm += float(gnorm.item())
+        n_steps += 1
 
         running_loss = total_loss / max(total_items, 1)
-        lr_current   = scheduler.get_last_lr()[0]
+        lr_current = scheduler.get_last_lr()[0]
 
-        if progress is not None and (
-            step % cfg.progress_refresh_steps == 0 or step == total_steps
-        ):
+        if progress is not None and (step % cfg.progress_refresh_steps == 0 or step == total_steps):
             acc, _ = _metrics(confusion)
-            _set_progress_postfix(
-                progress,
-                loss=running_loss,
-                acc=acc,
-                lr=lr_current,
-                gnorm=gnorm.item(),
-            )
+            _set_progress_postfix(progress, loss=running_loss, acc=acc, lr=lr_current, gnorm=float(gnorm.item()))
         elif progress is None and cfg.log_interval > 0 and step % cfg.log_interval == 0:
             acc, _ = _metrics(confusion)
             print(
@@ -210,35 +200,26 @@ def train_epoch(
                 f"loss={running_loss:.4f} acc={acc:.4f} lr={lr_current:.2e}"
             )
 
-    acc, f1  = _metrics(confusion)
+    acc, f1 = _metrics(confusion)
     avg_gnorm = total_gnorm / max(n_steps, 1)
-    lr_final  = scheduler.get_last_lr()[0]
-    _set_progress_postfix(
-        progress,
-        loss=total_loss / max(total_items, 1),
-        acc=acc,
-        lr=lr_final,
-        gnorm=avg_gnorm,
-    )
+    lr_final = scheduler.get_last_lr()[0]
+    _set_progress_postfix(progress, loss=total_loss / max(total_items, 1), acc=acc, lr=lr_final, gnorm=avg_gnorm)
     if progress is not None:
         progress.close()
     return total_loss / max(total_items, 1), acc, f1, avg_gnorm, lr_final
 
 
-# ── Evaluate ──────────────────────────────────────────────────────
-
 @torch.inference_mode()
 def evaluate(
     modelo: MejorRNN,
     loader: DataLoader,
-    cfg:    Config,
-    epoch:  int | None = None,
+    cfg: Config,
+    epoch: int | None = None,
 ) -> tuple[float, float, float]:
-    """Devuelve (loss, accuracy, f1)."""
     modelo.eval()
-    total_loss  = 0.0
+    total_loss = 0.0
     total_items = 0
-    confusion   = torch.zeros(cfg.num_classes, cfg.num_classes, dtype=torch.long)
+    confusion = torch.zeros(cfg.num_classes, cfg.num_classes, dtype=torch.long)
     amp_enabled = cfg.use_amp and cfg.device_type == "cuda"
     total_steps = len(loader)
     iterator, progress = _create_progress_bar(
@@ -251,34 +232,24 @@ def evaluate(
     non_blocking = _non_blocking(cfg)
 
     for step, (x, lengths, y) in enumerate(iterator, 1):
-        x       = x.to(cfg.device, non_blocking=non_blocking)
+        x = x.to(cfg.device, non_blocking=non_blocking)
         lengths = lengths.to(cfg.device, non_blocking=non_blocking)
-        y       = y.to(cfg.device, non_blocking=non_blocking)
+        y = y.to(cfg.device, non_blocking=non_blocking)
 
         with torch.amp.autocast(device_type=cfg.device_type, enabled=amp_enabled):
             logits, _ = modelo(x, lengths)
             loss = F.cross_entropy(logits, y)
 
         _update_cm(confusion, y, logits.argmax(1), cfg.num_classes)
-        total_loss  += loss.item() * x.size(0)
+        total_loss += loss.item() * x.size(0)
         total_items += x.size(0)
 
-        if progress is not None and (
-            step % cfg.progress_refresh_steps == 0 or step == total_steps
-        ):
+        if progress is not None and (step % cfg.progress_refresh_steps == 0 or step == total_steps):
             acc, _ = _metrics(confusion)
-            _set_progress_postfix(
-                progress,
-                loss=total_loss / max(total_items, 1),
-                acc=acc,
-            )
+            _set_progress_postfix(progress, loss=total_loss / max(total_items, 1), acc=acc)
 
     acc, f1 = _metrics(confusion)
-    _set_progress_postfix(
-        progress,
-        loss=total_loss / max(total_items, 1),
-        acc=acc,
-    )
+    _set_progress_postfix(progress, loss=total_loss / max(total_items, 1), acc=acc)
     if progress is not None:
         progress.close()
     return total_loss / max(total_items, 1), acc, f1
@@ -293,9 +264,9 @@ def evaluate_detailed(
     epoch: int | None = None,
 ) -> dict:
     modelo.eval()
-    total_loss  = 0.0
+    total_loss = 0.0
     total_items = 0
-    confusion   = torch.zeros(cfg.num_classes, cfg.num_classes, dtype=torch.long)
+    confusion = torch.zeros(cfg.num_classes, cfg.num_classes, dtype=torch.long)
     amp_enabled = cfg.use_amp and cfg.device_type == "cuda"
     total_steps = len(loader)
     iterator, progress = _create_progress_bar(
@@ -308,27 +279,21 @@ def evaluate_detailed(
     non_blocking = _non_blocking(cfg)
 
     for step, (x, lengths, y) in enumerate(iterator, 1):
-        x       = x.to(cfg.device, non_blocking=non_blocking)
+        x = x.to(cfg.device, non_blocking=non_blocking)
         lengths = lengths.to(cfg.device, non_blocking=non_blocking)
-        y       = y.to(cfg.device, non_blocking=non_blocking)
+        y = y.to(cfg.device, non_blocking=non_blocking)
 
         with torch.amp.autocast(device_type=cfg.device_type, enabled=amp_enabled):
             logits, _ = modelo(x, lengths)
             loss = F.cross_entropy(logits, y)
 
         _update_cm(confusion, y, logits.argmax(1), cfg.num_classes)
-        total_loss  += loss.item() * x.size(0)
+        total_loss += loss.item() * x.size(0)
         total_items += x.size(0)
 
-        if progress is not None and (
-            step % cfg.progress_refresh_steps == 0 or step == total_steps
-        ):
+        if progress is not None and (step % cfg.progress_refresh_steps == 0 or step == total_steps):
             acc, _ = _metrics(confusion)
-            _set_progress_postfix(
-                progress,
-                loss=total_loss / max(total_items, 1),
-                acc=acc,
-            )
+            _set_progress_postfix(progress, loss=total_loss / max(total_items, 1), acc=acc)
 
     loss = total_loss / max(total_items, 1)
     acc, f1 = _metrics(confusion)
@@ -347,30 +312,86 @@ def evaluate_detailed(
     }
 
 
-# ── Checkpoint ────────────────────────────────────────────────────
+@torch.inference_mode()
+def collect_prediction_rows(
+    modelo: MejorRNN,
+    loader: DataLoader,
+    cfg: Config,
+    class_names: list[str] | None = None,
+) -> list[dict]:
+    modelo.eval()
+    names = class_names or [str(idx) for idx in range(cfg.num_classes)]
+    rows: list[dict] = []
+    dataset = getattr(loader, "dataset", None)
+    offset = 0
+    non_blocking = _non_blocking(cfg)
+    amp_enabled = cfg.use_amp and cfg.device_type == "cuda"
+
+    for x, lengths, y in loader:
+        x = x.to(cfg.device, non_blocking=non_blocking)
+        lengths = lengths.to(cfg.device, non_blocking=non_blocking)
+        y = y.to(cfg.device, non_blocking=non_blocking)
+
+        with torch.amp.autocast(device_type=cfg.device_type, enabled=amp_enabled):
+            logits, attention = modelo(x, lengths)
+        probabilities = torch.softmax(logits, dim=-1).cpu()
+        preds = probabilities.argmax(dim=-1)
+        x_cpu = x.cpu()
+        lengths_cpu = lengths.cpu()
+        attention_cpu = attention.cpu()
+        y_cpu = y.cpu()
+
+        for local_idx in range(x_cpu.size(0)):
+            sample_idx = offset + local_idx
+            true_id = int(y_cpu[local_idx].item())
+            pred_id = int(preds[local_idx].item())
+            length = int(lengths_cpu[local_idx].item())
+            text = dataset.raw_text(sample_idx) if dataset is not None and hasattr(dataset, "raw_text") else ""
+            tokens = dataset.vocab.decode(x_cpu[local_idx, :length]) if dataset is not None and hasattr(dataset, "vocab") else []
+            rows.append(
+                {
+                    "index": sample_idx,
+                    "text": text,
+                    "tokens": tokens,
+                    "attention": attention_cpu[local_idx, :length].tolist(),
+                    "true_label_id": true_id,
+                    "true_label_name": names[true_id],
+                    "pred_label_id": pred_id,
+                    "pred_label_name": names[pred_id],
+                    "confidence": float(probabilities[local_idx, pred_id].item()),
+                    "probabilities": probabilities[local_idx].tolist(),
+                    "correct": pred_id == true_id,
+                }
+            )
+        offset += x_cpu.size(0)
+    return rows
+
+
+def highest_confidence_errors(rows: list[dict], *, top_n: int = 25) -> list[dict]:
+    mistakes = [row for row in rows if not row.get("correct")]
+    mistakes.sort(key=lambda row: float(row.get("confidence", 0.0)), reverse=True)
+    return mistakes[: max(1, top_n)]
+
 
 def save_checkpoint(
-    modelo:       MejorRNN,
-    optimizer:    AdamW,
-    epoch:        int,
+    modelo: MejorRNN,
+    optimizer: AdamW,
+    epoch: int,
     best_val_acc: float,
-    cfg:          Config,
-    vocab_state:  dict | None = None,
-    label_state:  dict | None = None,
-    scheduler:    OneCycleLR | None = None,
-    scaler:       torch.amp.GradScaler | None = None,
+    cfg: Config,
+    vocab_state: dict | None = None,
+    label_state: dict | None = None,
+    scheduler: OneCycleLR | None = None,
+    scaler: torch.amp.GradScaler | None = None,
     best_val_loss: float | None = None,
+    history: list[dict] | None = None,
 ):
-    """
-    Guarda modelo, optimizer, config y vocab en un solo archivo.
-    Incluir vocab permite hacer inferencia sin recargar el dataset.
-    """
     payload = {
-        "epoch":        epoch,
+        "epoch": epoch,
         "best_val_acc": best_val_acc,
-        "model":        modelo.state_dict(),
-        "optimizer":    optimizer.state_dict(),
-        "config":       {k: v for k, v in cfg.__dict__.items()},
+        "model": modelo.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "config": {key: value for key, value in cfg.__dict__.items()},
     }
     if best_val_loss is not None:
         payload["best_val_loss"] = best_val_loss
@@ -382,42 +403,35 @@ def save_checkpoint(
         payload["scheduler"] = scheduler.state_dict()
     if scaler is not None:
         payload["scaler"] = scaler.state_dict()
+    if history is not None:
+        payload["history"] = history
     torch.save(payload, cfg.checkpoint_path)
-    print(f"  checkpoint guardado -> {cfg.checkpoint_path}  (epoch {epoch})")
+    print(f"  checkpoint guardado -> {cfg.checkpoint_path} (epoch {epoch})")
 
 
 def load_checkpoint(
     path: str,
-    modelo: 'MejorRNN', # Asegúrate de que MejorRNN esté definido o usa 'Any'
+    modelo: MejorRNN,
     optimizer=None,
     scheduler=None,
     scaler=None,
     map_location: str = "cpu",
 ) -> dict:
-    """
-    Carga el checkpoint de forma segura. 
-    Verifica tamaños antes de cargar para evitar el error de 'size mismatch'.
-    """
     if not os.path.exists(path):
-        print(f"-> Archivo no encontrado en '{path}'. Se ignorará la carga y se empezará de cero.")
+        print(f"-> Archivo no encontrado en '{path}'. Se empezara desde cero.")
         return {}
 
     try:
         ckpt = torch.load(path, map_location=map_location)
-        
-        # 1. VERIFICACIÓN DE SEGURIDAD: Comparar tamaños de Embedding
-        # Esto evita el crash por size mismatch que recibiste
+
         ckpt_emb_shape = ckpt["model"]["embedding.weight"].shape
         curr_emb_shape = modelo.embedding.weight.shape
-        
         if ckpt_emb_shape != curr_emb_shape:
-            print(f"-> AVISO: El vocabulario no coincide. Checkpoint: {ckpt_emb_shape}, Modelo: {curr_emb_shape}")
-            print("-> Se omitirá la carga de pesos para evitar errores.")
+            print(f"-> Aviso: vocabulario distinto. Checkpoint: {ckpt_emb_shape}, Modelo: {curr_emb_shape}")
+            print("-> Se omite la carga de pesos para evitar un size mismatch.")
             return ckpt
 
-        # 2. CARGA SEGURA
         modelo.load_state_dict(ckpt["model"])
-        
         if optimizer is not None and "optimizer" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer"])
         if scheduler is not None and "scheduler" in ckpt:
@@ -425,20 +439,16 @@ def load_checkpoint(
         if scaler is not None and "scaler" in ckpt:
             scaler.load_state_dict(ckpt["scaler"])
 
-        # 3. LOGS Y RETURN
         epoch = ckpt.get("epoch", "?")
-        acc   = ckpt.get("best_val_acc", 0.0)
-        loss  = ckpt.get("best_val_loss")
+        acc = ckpt.get("best_val_acc", 0.0)
+        loss = ckpt.get("best_val_loss")
         extra = f" | best_val_loss={loss:.4f}" if isinstance(loss, (float, int)) else ""
-        
-        print(f"Checkpoint cargado exitosamente desde '{path}' | epoch={epoch} | best_val_acc={acc:.4f}{extra}")
+        print(f"Checkpoint cargado desde '{path}' | epoch={epoch} | best_val_acc={acc:.4f}{extra}")
         return ckpt
-
-    except Exception as e:
-        print(f"-> Error inesperado al cargar el checkpoint: {e}")
+    except Exception as exc:
+        print(f"-> Error al cargar el checkpoint: {exc}")
         return {}
 
-# ── Loop principal ────────────────────────────────────────────────
 
 def _is_better(val_acc, val_loss, best_acc, best_loss) -> bool:
     if val_acc > best_acc + 1e-4:
@@ -448,33 +458,41 @@ def _is_better(val_acc, val_loss, best_acc, best_loss) -> bool:
     return False
 
 
-def entrenar(
-    modelo:       MejorRNN,
-    train_loader: DataLoader,
-    val_loader:   DataLoader,
-    cfg:          Config,
-    vocab_state:  dict | None = None,
-    label_state:  dict | None = None,
-    start_epoch:  int = 1,
-    resume_checkpoint: str | None = None,
-) -> MejorRNN:
-    """
-    Entrena el modelo con early stopping y devuelve los mejores pesos.
+def _write_history_files(cfg: Config, history: list[dict]) -> list[str]:
+    artifact_dir = Path(cfg.artifacts_dir)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
 
-    Args:
-        vocab_state: word2idx del Vocabulary para guardar en el checkpoint
-        label_state: estado del codificador de etiquetas
-        start_epoch: epoch desde la que retomar (util al resumir entrenamiento)
-        resume_checkpoint: checkpoint para reanudar optimizer/scheduler/scaler
-    """
+    history_path = artifact_dir / "training_history.json"
+    history_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
+
+    created = [str(history_path)]
+    created.extend(
+        save_learning_curves(
+            history,
+            artifact_dir / "learning_curves.html",
+            png_path=artifact_dir / "learning_curves.png",
+        )
+    )
+    return created
+
+
+def entrenar(
+    modelo: MejorRNN,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    cfg: Config,
+    vocab_state: dict | None = None,
+    label_state: dict | None = None,
+    start_epoch: int = 1,
+    resume_checkpoint: str | None = None,
+    tracker=None,
+) -> MejorRNN:
     modelo = modelo.to(cfg.device)
 
-    # torch.compile acelera ~10-20% en GPU (PyTorch >= 2.0)
     if cfg.compile_model and cfg.device_type == "cuda" and hasattr(torch, "compile"):
         print("Compilando modelo con torch.compile()...")
         modelo = torch.compile(modelo)
 
-    # ── Optimizador ───────────────────────────────────────────────
     decay, no_decay = [], []
     for name, param in modelo.named_parameters():
         if not param.requires_grad:
@@ -485,36 +503,37 @@ def entrenar(
             decay.append(param)
 
     optimizer = AdamW(
-        [{"params": decay, "weight_decay": cfg.weight_decay},
-         {"params": no_decay, "weight_decay": 0.0}],
+        [
+            {"params": decay, "weight_decay": cfg.weight_decay},
+            {"params": no_decay, "weight_decay": 0.0},
+        ],
         lr=cfg.lr,
     )
 
-    # ── Scheduler ─────────────────────────────────────────────────
     scheduler = OneCycleLR(
         optimizer,
-        max_lr            = cfg.lr,
-        steps_per_epoch   = max(len(train_loader), 1),
-        epochs            = cfg.epochs,
-        pct_start         = cfg.pct_warmup,
-        anneal_strategy   = "cos",
-        div_factor        = 25.0,
-        final_div_factor  = 100.0,
+        max_lr=cfg.lr,
+        steps_per_epoch=max(len(train_loader), 1),
+        epochs=cfg.epochs,
+        pct_start=cfg.pct_warmup,
+        anneal_strategy="cos",
+        div_factor=25.0,
+        final_div_factor=100.0,
     )
-
-    # FIX: no pasar device= para compatibilidad con PyTorch < 2.3
     scaler = torch.amp.GradScaler(enabled=cfg.use_amp and cfg.device_type == "cuda")
 
-    best_val_acc  = 0.0
+    best_val_acc = 0.0
     best_val_loss = float("inf")
-    best_epoch    = start_epoch
-    patience      = 0
+    best_epoch = start_epoch
+    patience = 0
+    history: list[dict] = []
 
     if resume_checkpoint:
         ckpt = load_checkpoint(
             resume_checkpoint,
             modelo,
             optimizer=optimizer,
+            scheduler=scheduler,
             scaler=scaler,
             map_location=cfg.device,
         )
@@ -523,24 +542,29 @@ def entrenar(
         best_val_loss = float(ckpt.get("best_val_loss", float("inf")))
         best_epoch = ckpt_epoch if ckpt_epoch > 0 else start_epoch
         start_epoch = max(start_epoch, ckpt_epoch + 1)
-        completed_steps = ckpt_epoch * max(len(train_loader), 1)
-        if completed_steps > 0:
-            with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    "ignore",
-                    message="Detected call of `lr_scheduler.step\\(\\)` before `optimizer.step\\(\\)`",
-                )
-                for _ in range(completed_steps):
-                    scheduler.step()
+        history = list(ckpt.get("history", []))
+
+        if "scheduler" not in ckpt:
+            completed_steps = ckpt_epoch * max(len(train_loader), 1)
+            if completed_steps > 0:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore",
+                        message="Detected call of `lr_scheduler.step\\(\\)` before `optimizer.step\\(\\)`",
+                    )
+                    for _ in range(completed_steps):
+                        scheduler.step()
         print(f"Reanudando entrenamiento desde epoch {start_epoch}")
 
         if start_epoch > cfg.epochs:
             print("El checkpoint ya alcanzo o supero la ultima epoca configurada.")
             return modelo
 
-    header = (f"\n{'epoca':>5}  {'tr_loss':>8}  {'tr_acc':>7}  {'tr_f1':>7}  "
-              f"{'val_loss':>8}  {'val_acc':>7}  {'val_f1':>7}  "
-              f"{'gnorm':>6}  {'lr':>8}  {'t':>6}")
+    header = (
+        f"\n{'epoca':>5}  {'tr_loss':>8}  {'tr_acc':>7}  {'tr_f1':>7}  "
+        f"{'val_loss':>8}  {'val_acc':>7}  {'val_f1':>7}  "
+        f"{'gnorm':>6}  {'lr':>8}  {'t':>6}"
+    )
     print(header)
     print("-" * len(header))
 
@@ -552,9 +576,9 @@ def entrenar(
         )
         val_loss, val_acc, val_f1 = evaluate(modelo, val_loader, cfg, epoch=epoch)
 
-        elapsed  = time.time() - t0
+        elapsed = time.time() - t0
         improved = _is_better(val_acc, val_loss, best_val_acc, best_val_loss)
-        marker   = " *" if improved else ""
+        marker = " *" if improved else ""
 
         print(
             f"  {epoch:>3d}  {tr_loss:>8.4f}  {tr_acc:>7.4f}  {tr_f1:>7.4f}  "
@@ -562,11 +586,42 @@ def entrenar(
             f"{gnorm:>6.2f}  {lr:>8.2e}  {elapsed:>5.0f}s{marker}"
         )
 
+        history.append(
+            {
+                "epoch": epoch,
+                "train_loss": tr_loss,
+                "train_acc": tr_acc,
+                "train_f1": tr_f1,
+                "val_loss": val_loss,
+                "val_acc": val_acc,
+                "val_f1": val_f1,
+                "grad_norm": gnorm,
+                "lr": lr,
+                "elapsed_seconds": elapsed,
+                "improved": improved,
+            }
+        )
+
+        if tracker is not None:
+            tracker.log_epoch(
+                epoch,
+                {
+                    "train_loss": tr_loss,
+                    "train_acc": tr_acc,
+                    "train_f1": tr_f1,
+                    "val_loss": val_loss,
+                    "val_acc": val_acc,
+                    "val_f1": val_f1,
+                    "grad_norm": gnorm,
+                    "lr": lr,
+                },
+            )
+
         if improved:
-            best_val_acc  = val_acc
+            best_val_acc = val_acc
             best_val_loss = val_loss
-            best_epoch    = epoch
-            patience      = 0
+            best_epoch = epoch
+            patience = 0
             save_checkpoint(
                 modelo,
                 optimizer,
@@ -578,16 +633,34 @@ def entrenar(
                 scheduler=scheduler,
                 scaler=scaler,
                 best_val_loss=best_val_loss,
+                history=history,
             )
         else:
             patience += 1
             if patience >= cfg.early_stopping_patience:
-                print(f"\nEarly stopping en epoch {epoch} "
-                      f"(sin mejora por {cfg.early_stopping_patience} epocas).")
+                print(
+                    f"\nEarly stopping en epoch {epoch} "
+                    f"(sin mejora por {cfg.early_stopping_patience} epocas)."
+                )
                 break
 
-    print(f"\nMejor validacion -> epoch={best_epoch} "
-          f"acc={best_val_acc:.4f} loss={best_val_loss:.4f}")
+    print(f"\nMejor validacion -> epoch={best_epoch} acc={best_val_acc:.4f} loss={best_val_loss:.4f}")
+    load_checkpoint(cfg.checkpoint_path, modelo, map_location=cfg.device)
 
-    load_checkpoint(cfg.checkpoint_path, modelo)
+    artifacts = _write_history_files(cfg, history)
+    if tracker is not None:
+        tracker.log_summary(
+            {
+                "best_epoch": best_epoch,
+                "best_val_acc": best_val_acc,
+                "best_val_loss": best_val_loss,
+            }
+        )
+        for artifact in artifacts:
+            tracker.log_artifact(artifact)
+
+    setattr(modelo, "training_history", history)
+    setattr(modelo, "best_epoch", best_epoch)
+    setattr(modelo, "best_val_acc", best_val_acc)
+    setattr(modelo, "best_val_loss", best_val_loss)
     return modelo
