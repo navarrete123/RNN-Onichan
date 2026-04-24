@@ -11,6 +11,7 @@ __pycache__/
 # Modelos y datos temporales
 *.pt
 *.csv
+artifacts/
 
 # Carpetas de VS Code
 .vscode/
