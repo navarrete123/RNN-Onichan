@@ -23,7 +23,7 @@ Requisitos:
 from __future__ import annotations
 
 import argparse
-import subprocess
+import runpy
 import sys
 import time
 from pathlib import Path
@@ -37,11 +37,27 @@ ETAPAS = [
 
 
 def run_step(script: str, extra_args: list[str]) -> bool:
-    script_path = Path(__file__).parent / script
-    cmd = [sys.executable, str(script_path)] + extra_args
-    print(f"\n  Ejecutando: {' '.join(cmd)}")
-    result = subprocess.run(cmd)
-    return result.returncode == 0
+    allowed_scripts = {name for name, _ in ETAPAS}
+    if script not in allowed_scripts:
+        raise ValueError(f"Script de pipeline no permitido: {script}")
+
+    base_dir = Path(__file__).resolve().parent
+    script_path = (base_dir / script).resolve()
+    if base_dir not in script_path.parents or not script_path.is_file():
+        raise FileNotFoundError(f"No se encontro una etapa valida: {script_path}")
+
+    argv = [str(script_path), *extra_args]
+    print(f"\n  Ejecutando: {sys.executable} {' '.join(argv)}")
+
+    previous_argv = sys.argv[:]
+    try:
+        sys.argv = argv
+        runpy.run_path(str(script_path), run_name="__main__")
+        return True
+    except SystemExit as exc:
+        return exc.code in (0, None)
+    finally:
+        sys.argv = previous_argv
 
 
 def main():
