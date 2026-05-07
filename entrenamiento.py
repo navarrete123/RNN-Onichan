@@ -422,7 +422,7 @@ def load_checkpoint(
         return {}
 
     try:
-        ckpt = torch.load(path, map_location=map_location)
+        ckpt = torch.load(path, map_location=map_location, weights_only=False)
 
         ckpt_emb_shape = ckpt["model"]["embedding.weight"].shape
         curr_emb_shape = modelo.embedding.weight.shape
@@ -486,7 +486,8 @@ def entrenar(
     start_epoch: int = 1,
     resume_checkpoint: str | None = None,
     tracker=None,
-) -> MejorRNN:
+    return_history: bool = False,
+):
     modelo = modelo.to(cfg.device)
 
     if cfg.compile_model and cfg.device_type == "cuda" and hasattr(torch, "compile"):
@@ -526,7 +527,9 @@ def entrenar(
     best_val_loss = float("inf")
     best_epoch = start_epoch
     patience = 0
-    history: list[dict] = []
+    history: list[dict] = []  # Coleccion de datos para el PDF/reporte final.
+
+    print(f"\nEntrenando {cfg.rnn_type.upper()}...")
 
     if resume_checkpoint:
         ckpt = load_checkpoint(
@@ -558,7 +561,8 @@ def entrenar(
 
         if start_epoch > cfg.epochs:
             print("El checkpoint ya alcanzo o supero la ultima epoca configurada.")
-            return modelo
+            setattr(modelo, "training_history", history)
+            return (modelo, history) if return_history else modelo
 
     header = (
         f"\n{'epoca':>5}  {'tr_loss':>8}  {'tr_acc':>7}  {'tr_f1':>7}  "
@@ -586,12 +590,16 @@ def entrenar(
             f"{gnorm:>6.2f}  {lr:>8.2e}  {elapsed:>5.0f}s{marker}"
         )
 
+        # Guardamos cada paso para graficar y generar el informe despues.
         history.append(
             {
                 "epoch": epoch,
                 "train_loss": tr_loss,
                 "train_acc": tr_acc,
                 "train_f1": tr_f1,
+                "tr_loss": tr_loss,
+                "tr_acc": tr_acc,
+                "tr_f1": tr_f1,
                 "val_loss": val_loss,
                 "val_acc": val_acc,
                 "val_f1": val_f1,
@@ -663,4 +671,4 @@ def entrenar(
     setattr(modelo, "best_epoch", best_epoch)
     setattr(modelo, "best_val_acc", best_val_acc)
     setattr(modelo, "best_val_loss", best_val_loss)
-    return modelo
+    return (modelo, history) if return_history else modelo

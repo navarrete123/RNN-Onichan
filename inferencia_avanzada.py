@@ -63,7 +63,7 @@ def load_inference_bundle(
     if not ckpt_path.exists():
         raise FileNotFoundError(f"No existe checkpoint en '{ckpt_path}'")
 
-    raw = torch.load(str(ckpt_path), map_location="cpu")
+    raw = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
 
     infer_cfg = Config(**raw["config"]) if "config" in raw else cfg
     infer_cfg.device = cfg.device
@@ -218,6 +218,11 @@ def save_batch_predictions(
     key = text_column.strip().lower()
     if key not in normalized:
         raise ValueError(f"No existe la columna '{text_column}' en {source}")
+    if len(predictions) != len(rows):
+        raise ValueError(
+            "La cantidad de predicciones no coincide con las filas del archivo de entrada "
+            f"({len(predictions)} != {len(rows)})."
+        )
 
     out_fields = list(fieldnames) + [
         "pred_label",

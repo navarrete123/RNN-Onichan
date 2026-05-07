@@ -58,6 +58,19 @@ from modelo_profesional import MejorRNN
 from tracking_experimentos import create_tracker
 from visualizacion import save_attention_html, save_error_analysis_html
 
+try:
+    from reporte import generar_informe_detallado
+except ImportError:
+    generar_informe_detallado = None
+
+try:
+    from reporte_profesional import generar_pdf_profesional
+except ImportError:
+    try:
+        from reporte import generar_pdf_profesional
+    except ImportError:
+        generar_pdf_profesional = None
+
 
 def _artifact_dir(cfg: Config) -> Path:
     path = Path(cfg.artifacts_dir)
@@ -67,6 +80,20 @@ def _artifact_dir(cfg: Config) -> Path:
 
 def _default_artifact_path(cfg: Config, filename: str) -> str:
     return str(_artifact_dir(cfg) / filename)
+
+
+def _require_existing_path(path: str | Path, *, label: str) -> Path:
+    resolved = Path(path)
+    if not resolved.exists():
+        raise FileNotFoundError(f"No existe {label}: '{resolved}'")
+    return resolved
+
+
+def _normalize_text_inputs(texts: list[str] | None) -> list[str]:
+    if not texts:
+        return []
+    cleaned = [str(text).strip() for text in texts if str(text).strip()]
+    return cleaned
 
 
 def _build_text_augmenter(cfg: Config, *, seed: int | None = None):
@@ -142,7 +169,7 @@ def _train_single_model(
         if resume and not resume_ckpt:
             print(f"Aviso: no se encontro checkpoint en '{cfg.checkpoint_path}', entrenando desde cero.")
 
-        modelo = entrenar(
+        modelo, historial = entrenar(
             modelo,
             train_loader,
             val_loader,
@@ -151,7 +178,9 @@ def _train_single_model(
             label_state=label_encoder.state_dict(),
             resume_checkpoint=resume_ckpt,
             tracker=tracker,
+            return_history=True,
         )
+        setattr(modelo, "training_history", historial)
         return modelo, tracker
     except Exception:
         tracker.finish("failed")
@@ -214,7 +243,7 @@ def _predict_with_loaded_target(target, texts: list[str]) -> list[dict[str, Any]
 
 
 def _save_attention_if_requested(results: list[dict[str, Any]], cfg: Config, output_path: str | None):
-    if not results or output_path is None:
+    if not results:
         return None
     destination = output_path or _default_artifact_path(cfg, "attention.html")
     path = save_attention_html(
@@ -372,6 +401,10 @@ def modo_entrenar_texto(cfg: Config, args):
     seed_everything(cfg.seed)
     _artifact_dir(cfg)
 
+    _require_existing_path(args.train_data, label="train-data")
+    if args.val_data is not None:
+        _require_existing_path(args.val_data, label="val-data")
+
     vocab_path = Path(cfg.vocab_path)
     if vocab_path.exists():
         vocab = Vocabulary.load(vocab_path)
@@ -496,8 +529,28 @@ def modo_imdb(cfg: Config, args):
         label_encoder,
         resume=args.resume,
     )
-    report = evaluate_detailed(modelo, test_loader, cfg, class_names=label_encoder.class_names)
-    _print_report("Test final", report)
+    # EVALUACION FINAL DETALLADA
+    reporte_final = evaluate_detailed(modelo, test_loader, cfg, class_names=label_encoder.class_names)
+    _print_report("Test final", reporte_final)
+
+    historial = getattr(modelo, "training_history", [])
+    if generar_informe_detallado is not None and historial:
+        generar_informe_detallado(cfg, historial, reporte_final)
+        print("Informe detallado generado exitosamente.")
+    elif generar_informe_detallado is None:
+        print("Modulo 'reporte.py' no encontrado. Saltando informe detallado.")
+
+    # GENERACION DEL PDF
+    if generar_pdf_profesional is not None and historial:
+        print("\nGenerando PDF con graficos y metricas...")
+        try:
+            generar_pdf_profesional(cfg, historial, reporte_final)
+        except Exception as exc:
+            print(f"\n[!] No se pudo generar el PDF: {exc}")
+    elif generar_pdf_profesional is None:
+        print("\n[!] No se pudo generar el PDF: Falta reporte_profesional.py")
+
+    print(f"\nProceso completado. Accuracy final: {reporte_final['accuracy']:.4f}")
 
     error_path = _save_error_report(
         modelo,
@@ -512,11 +565,16 @@ def modo_imdb(cfg: Config, args):
 
     cfg.save(_artifact_dir(cfg) / "config.json")
     _demo_predicciones(modelo, vocab, label_encoder, cfg, attention_html=args.attention_html)
+    print("\nProceso finalizado con exito.")
 
 
 def modo_infer(cfg: Config, args):
     target = _load_predictor(cfg, args)
-    results = _predict_with_loaded_target(target, args.infer_text)
+    texts = _normalize_text_inputs(args.infer_text)
+    if not texts:
+        raise ValueError("Debes pasar al menos un texto no vacio en --infer-text")
+
+    results = _predict_with_loaded_target(target, texts)
     print("\nInferencia")
     print("-" * 60)
     for idx, result in enumerate(results, 1):
@@ -533,7 +591,7 @@ def modo_infer(cfg: Config, args):
 
 def modo_batch(cfg: Config, args):
     target = _load_predictor(cfg, args)
-    input_path = Path(args.batch_input)
+    input_path = _require_existing_path(args.batch_input, label="batch-input")
     if args.batch_output:
         output_path = Path(args.batch_output)
     else:
@@ -657,6 +715,7 @@ def parse_args():
         description="RNN - clasificacion de texto con analisis, exportacion y serving",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
+        allow_abbrev=False,
     )
 
     mode = parser.add_argument_group("Modo de ejecucion")
